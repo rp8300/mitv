@@ -187,6 +187,11 @@ nav.tabs button[aria-selected="true"]{color:var(--ink);border-color:var(--signal
   <section id="tab-live" hidden>
     <div class="chips" id="liveCats"></div>
     <div class="controls"><input type="search" id="liveSearch" placeholder="Buscar canal o número" aria-label="Buscar canal"></div>
+    <div class="controls">
+      <label class="chip" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="optHide"> Ocultar canales sin señal</label>
+      <label class="chip" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="optSkip"> Saltar solo al siguiente</label>
+    </div>
+    <p class="note" id="downNote" hidden></p>
     <div id="liveList" class="channels"></div>
   </section>
 
@@ -437,8 +442,35 @@ function nowOn(ch, t = Date.now()){ const l = progsFor(ch); return l ? l.find(p 
 
 /* ---------- Reproductor ---------- */
 let hls = null, current = null, urlIdx = 0, startTimer = null, currentList = null, tryList = [];
+/* Canales sin señal: se ocultan y se vuelven a comprobar solos */
+const HEALTH_KEY = 'mitv:health', FAIL_TTL = 3*3600e3;
+let health = store.get(HEALTH_KEY, {});
+let hideDown = store.get('mitv:hideDown', true), autoSkip = store.get('mitv:autoSkip', true);
+let skipCount = 0, lastDir = 1, skipTimer = null;
+const isDown = ch => { const x = ch && health[ch.key]; return !!(x && Date.now() - x.fail < FAIL_TTL); };
+const visible = list => hideDown ? list.filter(c => !isDown(c)) : list;
+function saveHealth(){ for (const k in health) if (Date.now() - health[k].fail >= FAIL_TTL) delete health[k]; store.set(HEALTH_KEY, health); }
+function markFail(ch){ if (!ch || !ch.key) return; health[ch.key] = { fail: Date.now() }; saveHealth(); }
+function markOk(ch){ if (ch && ch.key && health[ch.key]){ delete health[ch.key]; saveHealth(); renderAll(); } }
+async function recheck(){
+  const byKey = new Map(channels.map(c => [c.key, c]));
+  const todo = Object.keys(health).map(k => byKey.get(k)).filter(Boolean);
+  if (!todo.length) return;
+  let changed = false;
+  const probe = async ch => {
+    for (const u of ch.urls || []){
+      let url = u.url; if (location.protocol === 'https:' && /^http:/i.test(url)) url = 'https:' + url.slice(5);
+      const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 6000);
+      try{ await fetch(url, { mode: 'no-cors', signal: ctl.signal, cache: 'no-store' }); clearTimeout(t); delete health[ch.key]; changed = true; return; }
+      catch(e){ clearTimeout(t); }
+    }
+  };
+  for (let i = 0; i < todo.length; i += 4) await Promise.all(todo.slice(i, i + 4).map(probe));
+  if (changed){ saveHealth(); renderAll(); }
+}
+setInterval(recheck, 10*60000);
 function play(item, list){
-  current = item; urlIdx = 0;
+  current = item; urlIdx = 0; clearTimeout(skipTimer);
   currentList = item.live ? (list && list.length ? list : channels) : null;
   $('#zap').hidden = !currentList || currentList.length < 2;
   $('#idle').hidden = true; $('#nowbar').hidden = false;
@@ -454,12 +486,17 @@ function play(item, list){
   document.querySelectorAll(`.ch[data-key="${CSS.escape(item.key||'')}"]`).forEach(x => x.classList.add('on'));
   window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
 }
-function zap(step){
+function zap(step, auto){
   if (!current || !currentList || !currentList.length) return;
-  let i = currentList.findIndex(c => c.key === current.key);
+  if (!auto) skipCount = 0;
+  lastDir = step;
+  const list = currentList, n = list.length;
+  let i = list.findIndex(c => c.key === current.key);
   if (i < 0) i = step > 0 ? -1 : 0;
-  const n = currentList.length;
-  play(currentList[(i + step + n) % n], currentList);
+  for (let k = 1; k <= n; k++){
+    const c = list[((i + step*k) % n + n) % n];
+    if (!isDown(c) || k === n){ play(c, list); return; }
+  }
 }
 $('#chPrev').onclick = () => zap(-1);
 $('#chNext').onclick = () => zap(1);
@@ -468,11 +505,23 @@ function tryUrl(){
   if (urlIdx === 0){
     const base = current.urls ? current.urls.map(u => u.url) : [current.url];
     const secure = location.protocol === 'https:';
-    tryList = [...new Set(base.flatMap(u => secure && /^http:/i.test(u) ? ['https:' + u.slice(5), u] : [u]))];
-    if (secure) tryList.sort((a,b) => /^http:/i.test(a) - /^http:/i.test(b));
+    tryList = [...new Set(base.map(u => secure && /^http:/i.test(u) ? 'https:' + u.slice(5) : u))];
   }
   const urls = tryList;
-  if (urlIdx >= urls.length){ $('#nowMsg').textContent = 'Esta señal no está disponible ahora. Pulsa «Canal siguiente» para probar otro.'; return; }
+  if (urlIdx >= urls.length){
+    if (hls){ hls.destroy(); hls = null; }
+    if (!current.live){ $('#nowMsg').textContent = 'Este vídeo no está disponible ahora. Prueba otro.'; return; }
+    markFail(current);
+    if (autoSkip && currentList && currentList.length > 1 && skipCount < 10){
+      skipCount++;
+      $('#nowMsg').textContent = `${current.name} no transmite ahora. Pasando al siguiente…`;
+      skipTimer = setTimeout(() => zap(lastDir, true), 1200);
+    } else {
+      $('#nowMsg').textContent = skipCount >= 10 ? 'Varios canales seguidos sin señal. Prueba otra categoría o región.' : 'Este canal no transmite ahora. Pulsa «Canal siguiente».';
+      skipCount = 0;
+    }
+    return;
+  }
   const url = urls[urlIdx];
   $('#nowMsg').textContent = urlIdx ? `Probando señal alternativa ${urlIdx+1} de ${urls.length}…` : 'Cargando…';
   if (hls){ hls.destroy(); hls = null; }
@@ -493,7 +542,7 @@ function tryUrl(){
   } else { video.src = url; video.play().catch(()=>{}); video.onerror = next; }
   if (current.live) startTimer = setTimeout(() => { if (video.readyState < 2) next(); }, 9000);
 }
-video.addEventListener('playing', () => { clearTimeout(startTimer); $('#nowMsg').textContent = ''; });
+video.addEventListener('playing', () => { clearTimeout(startTimer); $('#nowMsg').textContent = ''; skipCount = 0; if (current && current.live) markOk(current); });
 function updateNow(){
   if (!current) return;
   const p = current.live ? nowOn(current) : null;
@@ -555,11 +604,11 @@ function renderHome(){
   box.innerHTML = '';
   const recent = store.get('mitv:recent', []);
   if (recent.length) box.appendChild(row('Seguir viendo', recent.map(card)));
-  const withNow = channels.filter(c => nowOn(c));
+  const withNow = visible(channels).filter(c => nowOn(c));
   if (withNow.length) box.appendChild(row('Ahora en TV', withNow.slice(0,20).map(card), () => { guideCat = 'todos'; showTab('guide'); }));
   CATS.forEach(([k,n]) => {
-    const list = channels.filter(c => c.cat === k && !c.warn);
-    const all = list.length ? list : channels.filter(c => c.cat === k);
+    const list = visible(channels).filter(c => c.cat === k && !c.warn);
+    const all = list.length ? list : visible(channels).filter(c => c.cat === k);
     if (all.length) box.appendChild(row(n, all.slice(0,18).map(card), () => { liveCat = k; showTab('live'); }));
   });
   const mv = document.createElement('div'); box.appendChild(mv);
@@ -586,7 +635,7 @@ function chRow(ch, list){
   const b = document.createElement('button');
   b.className = 'ch' + (current && current.key && current.key === ch.key ? ' on' : ''); b.dataset.key = ch.key || '';
   const p = nowOn(ch);
-  const sub = p ? `Ahora: ${p[2]}` : [CAT_NAME[ch.cat], region === 'latam' || region === 'centro' ? COUNTRY[ch.country] : '', ch.warn ? 'puede fallar' : ''].filter(Boolean).join(' · ');
+  const sub = p ? `Ahora: ${p[2]}` : [CAT_NAME[ch.cat], region === 'latam' || region === 'centro' ? COUNTRY[ch.country] : '', isDown(ch) ? 'sin señal ahora' : ch.warn ? 'puede fallar' : ''].filter(Boolean).join(' · ');
   b.innerHTML = `<span class="no">${ch.number ?? ''}</span><span class="logo">${logoHTML(ch)}</span><span style="min-width:0"><span class="n">${esc(ch.name)}</span><span class="g" style="display:block">${esc(sub)}</span></span>`;
   b.onclick = () => play(ch, list); return b;
 }
@@ -599,7 +648,11 @@ function renderList(el, items, limit = 400){
 function renderLive(){
   chips($('#liveCats'), liveCat, k => { liveCat = k; renderLive(); });
   const q = $('#liveSearch').value.trim().toLowerCase();
-  renderList($('#liveList'), channels.filter(c => (liveCat === 'todos' || c.cat === liveCat) && (!q || c.name.toLowerCase().includes(q) || String(c.number) === q)));
+  renderList($('#liveList'), visible(channels).filter(c => (liveCat === 'todos' || c.cat === liveCat) && (!q || c.name.toLowerCase().includes(q) || String(c.number) === q)));
+  const down = channels.filter(isDown).length;
+  $('#downNote').hidden = !down;
+  $('#downNote').innerHTML = down ? `${down} canal${down > 1 ? 'es' : ''} sin señal ${hideDown ? 'oculto' + (down > 1 ? 's' : '') : 'marcado' + (down > 1 ? 's' : '')}. Se comprueban solos cada 10 minutos y vuelven a aparecer cuando transmiten. <button class="iconbtn" id="downReset">Mostrar todos ahora</button>` : '';
+  const r = $('#downReset'); if (r) r.onclick = () => { health = {}; saveHealth(); renderAll(); };
 }
 $('#liveSearch').oninput = renderLive;
 
@@ -612,7 +665,7 @@ function renderGuide(){
   const box = $('#guideBox');
   if (!EPG.ready){ box.innerHTML = '<p class="loading">Descargando la guía de programación… puede tardar unos segundos.</p>'; loadEPG(); return; }
   const only = $('#guideOnly').checked;
-  let list = channels.filter(c => guideCat === 'todos' || c.cat === guideCat);
+  let list = visible(channels).filter(c => guideCat === 'todos' || c.cat === guideCat);
   if (only) list = list.filter(c => progsFor(c));
   if (!list.length){
     box.innerHTML = `<p class="empty">${only ? 'Ningún canal de esta selección tiene guía. Desmarca «Solo canales con programación» o elige otra región, como México.' : 'No hay canales en esta categoría.'}</p>`; return;
@@ -661,7 +714,7 @@ $('#guideNow').onclick = () => { renderGuide(); };
 
 function renderMovieLive(){
   const box = $('#movieLive'); box.innerHTML = '';
-  const list = channels.filter(c => c.cat === 'cine' && !c.warn);
+  const list = visible(channels).filter(c => c.cat === 'cine' && !c.warn);
   if (list.length) box.appendChild(row('Canales de cine en vivo', list.slice(0,20).map(card), () => { liveCat = 'cine'; showTab('live'); }));
 }
 /* ---------- Internet Archive ---------- */
@@ -763,7 +816,10 @@ function renderAll(){
   updateNow();
 }
 const savedCustom = store.get('mitv:customUrl', ''); if (savedCustom) $('#customUrl').value = savedCustom;
-loadRegion().then(() => loadEPG());
+$('#optHide').checked = hideDown; $('#optSkip').checked = autoSkip;
+$('#optHide').onchange = e => { hideDown = e.target.checked; store.set('mitv:hideDown', hideDown); renderAll(); };
+$('#optSkip').onchange = e => { autoSkip = e.target.checked; store.set('mitv:autoSkip', autoSkip); };
+loadRegion().then(() => { loadEPG(); recheck(); });
 </script>
 </body>
 </html>
