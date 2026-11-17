@@ -345,6 +345,36 @@ function parseM3U(text){
 
 /* ---------- Canales ---------- */
 let channels = [];
+/* ---------- Pluto TV: canales gratuitos oficiales con publicidad ---------- */
+const PLUTO_URL = 'https://raw.githubusercontent.com/matthuisman/i.mjh.nz/master/PlutoTV/.channels.json.gz';
+const PLUTO_REGION = { ar:'ar', cl:'cl', mx:'mx', es:'es', us:'us', bs:'us' };
+const PLUTO_CAT = { 'películas':'cine', 'peliculas':'cine', 'movies':'cine', 'series':'cine', 'novelas':'cine', 'comedia':'cine', 'comedy':'cine', 'drama':'cine', 'retro':'cine', 'south park':'cine', 'crimen':'cine', 'crime':'cine', 'classic tv':'cine',
+  'deportes':'deportes', 'sports':'deportes', 'noticias':'noticias', 'news':'noticias', 'kids':'infantil', 'niños':'infantil', 'infantil':'infantil', 'teen':'infantil', 'anime & gaming':'infantil', 'anime':'infantil',
+  'música':'musica', 'music':'musica', 'curiosidad':'cultura', 'investigación':'cultura', 'zona paranormal':'cultura', 'documentales':'cultura', 'history & science':'cultura', 'en español':'generales' };
+let plutoData = null;
+async function fetchGzJSON(url){
+  const r = await fetch(url); if (!r.ok) throw new Error('http');
+  const buf = await r.arrayBuffer(); const head = new Uint8Array(buf, 0, 2);
+  if (head[0] === 0x1f && head[1] === 0x8b){
+    if (!('DecompressionStream' in window)) throw new Error('gz');
+    return JSON.parse(await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+  }
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+async function loadPluto(){
+  if (!plutoData) plutoData = await fetchGzJSON(PLUTO_URL);
+  const reg = PLUTO_REGION[region] || 'mx';
+  const chs = (plutoData.regions[reg] || {}).channels || {};
+  return Object.entries(chs).map(([id, c]) => {
+    const g = (c.group || '').toLowerCase();
+    let cat = PLUTO_CAT[g] || 'entretenimiento';
+    if (/f[uú]tbol|soccer|sport|deport|fifa|bar[cç]a|liga|gol\b|ufc|mma|nfl|peleas/i.test(c.name)) cat = 'deportes';
+    const ps = (c.programs || []).map((p, i, a) => [p[0]*1000, (a[i+1] ? a[i+1][0] : p[0] + 3600)*1000, p[1], '']);
+    return { key: 'pluto:' + id, name: c.name.replace(/^Pluto TV /, 'Pluto ').trim(), logo: c.logo, country: reg, cat, source: 'Pluto TV',
+             urls: [{ url: `https://jmp2.uk/plu-${id}.m3u8`, warn: false }], live: true, progs: ps.length ? ps : null, pluto: true,
+             futbol: /f[uú]tbol|soccer|fifa|bar[cç]a|liga|gol\b/i.test(c.name) };
+  });
+}
 async function loadRegion(){
   $('#homeRows').innerHTML = '<p class="loading">Cargando canales…</p>';
   const codes = REGIONS[region].c;
@@ -361,9 +391,11 @@ async function loadRegion(){
     }
   }
   const order = Object.fromEntries(CATS.map(([k],i) => [k,i]));
-  channels = [...map.values()];
+  let pluto = [];
+  try{ pluto = await loadPluto(); }catch(e){}
+  channels = [...pluto, ...map.values()];
   channels.forEach(ch => { ch.urls.sort((a,b) => a.warn - b.warn); ch.warn = ch.urls.every(u => u.warn); });
-  channels.sort((a,b) => order[a.cat]-order[b.cat] || (a.warn-b.warn) || (!a.logo - !b.logo) || a.name.localeCompare(b.name));
+  channels.sort((a,b) => order[a.cat]-order[b.cat] || (!!b.futbol - !!a.futbol) || (!!b.pluto - !!a.pluto) || (a.warn-b.warn) || (!a.logo - !b.logo) || a.name.localeCompare(b.name));
   // Numeración por bloques de categoría, al estilo de un cableoperador
   let n = 0, last = null;
   channels.forEach(ch => { if (ch.cat !== last){ n = Math.ceil((n+1)/100)*100; last = ch.cat; } ch.number = n++; });
@@ -437,7 +469,7 @@ function epgId(ch){
   const id = EPG.names[norm(ch.name)];
   return id && EPG.progs[id] ? id : null;
 }
-function progsFor(ch){ const id = epgId(ch); return id ? EPG.progs[id] : null; }
+function progsFor(ch){ if (ch.progs) return ch.progs; const id = epgId(ch); return id ? EPG.progs[id] : null; }
 function nowOn(ch, t = Date.now()){ const l = progsFor(ch); return l ? l.find(p => p[0] <= t && t < p[1]) : null; }
 
 /* ---------- Reproductor ---------- */
@@ -500,7 +532,7 @@ function zap(step, auto){
 }
 $('#chPrev').onclick = () => zap(-1);
 $('#chNext').onclick = () => zap(1);
-function slim(ch){ return { key: ch.key, name: ch.name, logo: ch.logo, tvgId: ch.tvgId, urls: ch.urls, live: ch.live, number: ch.number, cat: ch.cat, country: ch.country, url: ch.url }; }
+function slim(ch){ return { pluto: ch.pluto, source: ch.source, key: ch.key, name: ch.name, logo: ch.logo, tvgId: ch.tvgId, urls: ch.urls, live: ch.live, number: ch.number, cat: ch.cat, country: ch.country, url: ch.url }; }
 function tryUrl(){
   if (urlIdx === 0){
     const base = current.urls ? current.urls.map(u => u.url) : [current.url];
@@ -589,7 +621,7 @@ function card(ch){
   const b = document.createElement('button'); b.className = 'card';
   const p = nowOn(ch);
   b.innerHTML = `<div class="art">${logoHTML(ch)}<span class="no">${ch.number ?? ''}</span><span class="vivo"></span></div>
-    <div class="n">${esc(ch.name)}</div><div class="p">${esc(p ? 'Ahora: ' + p[2] : (COUNTRY[ch.country] || ''))}</div>`;
+    <div class="n">${esc(ch.name)}</div><div class="p">${esc(p ? 'Ahora: ' + p[2] : (ch.source || COUNTRY[ch.country] || ''))}</div>`;
   b.onclick = () => play(ch); return b;
 }
 function row(title, items, onMore){
@@ -604,6 +636,11 @@ function renderHome(){
   box.innerHTML = '';
   const recent = store.get('mitv:recent', []);
   if (recent.length) box.appendChild(row('Seguir viendo', recent.map(card)));
+  const futbol = visible(channels).filter(c => c.futbol);
+  const deportes = visible(channels).filter(c => c.cat === 'deportes' && c.pluto && !c.futbol);
+  if (futbol.length || deportes.length) box.appendChild(row('Fútbol y deportes en vivo', [...futbol, ...deportes].slice(0,20).map(card), () => { liveCat = 'deportes'; showTab('live'); }));
+  const cine = visible(channels).filter(c => c.cat === 'cine' && c.pluto);
+  if (cine.length) box.appendChild(row('Cine y series 24 horas', cine.slice(0,24).map(card), () => { liveCat = 'cine'; showTab('live'); }));
   const withNow = visible(channels).filter(c => nowOn(c));
   if (withNow.length) box.appendChild(row('Ahora en TV', withNow.slice(0,20).map(card), () => { guideCat = 'todos'; showTab('guide'); }));
   CATS.forEach(([k,n]) => {
@@ -635,7 +672,7 @@ function chRow(ch, list){
   const b = document.createElement('button');
   b.className = 'ch' + (current && current.key && current.key === ch.key ? ' on' : ''); b.dataset.key = ch.key || '';
   const p = nowOn(ch);
-  const sub = p ? `Ahora: ${p[2]}` : [CAT_NAME[ch.cat], region === 'latam' || region === 'centro' ? COUNTRY[ch.country] : '', isDown(ch) ? 'sin señal ahora' : ch.warn ? 'puede fallar' : ''].filter(Boolean).join(' · ');
+  const sub = p ? `Ahora: ${p[2]}` : [ch.source, CAT_NAME[ch.cat], (region === 'latam' || region === 'centro') && !ch.pluto ? COUNTRY[ch.country] : '', isDown(ch) ? 'sin señal ahora' : ch.warn ? 'puede fallar' : ''].filter(Boolean).join(' · ');
   b.innerHTML = `<span class="no">${ch.number ?? ''}</span><span class="logo">${logoHTML(ch)}</span><span style="min-width:0"><span class="n">${esc(ch.name)}</span><span class="g" style="display:block">${esc(sub)}</span></span>`;
   b.onclick = () => play(ch, list); return b;
 }
